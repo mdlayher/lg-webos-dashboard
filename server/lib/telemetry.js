@@ -16,6 +16,7 @@ var lanAddress = require('./util').lanAddress;
 var path = require('path');
 var execFile = require('child_process').execFile;
 var names = require('./names');
+var power = require('./power');
 var timers = require('./timers');
 
 // LG's own reading where it exists. Models without it (the 55QNED826QB, webOS
@@ -41,8 +42,6 @@ var gameModule = null;
 var powerModule = null;
 var alwaysReadyScreenOn = false;
 var tvwebVersionStr = '0.0.0';
-var mapPowerStateFn = null;
-var isScreenSaverFn = null;
 
 var HARDWARE_INFO = {
   webos: null,
@@ -116,7 +115,6 @@ var statsCollected = false;
 var isCollecting = false;
 var statsWaiters = [];
 
-var EOL_MAP = { 1: 'Normal', 2: 'Warning', 3: 'Urgent' };
 var EMMC_CACHE = null;
 var SWAP_BACKING_CACHE = null;
 var MAC_CACHE = {};
@@ -157,8 +155,6 @@ function init(opts) {
   gameModule = opts.game;
   powerModule = opts.power || null;
   tvwebVersionStr = opts.tvwebVersion || '0.0.0';
-  mapPowerStateFn = opts.mapPowerState;
-  isScreenSaverFn = opts.isScreenSaver;
   loadHdmiSeen();
   hasMediaState = readTrimmed(MEDIA_SEEN_FILE) !== null;
 }
@@ -178,7 +174,8 @@ function emmcInfo() {
   if (EMMC_CACHE) return EMMC_CACHE;
   var raw = readTrimmed('/sys/block/mmcblk0/device/life_time');
   var eolRaw = readTrimmed('/sys/block/mmcblk0/device/pre_eol_info');
-  var eol = EOL_MAP[parseInt(eolRaw, 16)] || 'unknown';
+  var eolState = names.emmcEol(parseInt(eolRaw, 16));
+  var eol = eolState ? eolState.display : 'unknown';
   if (!raw) {
     EMMC_CACHE = { life: 'unknown', wear: 'unknown', health: 'unknown', eol: eol, life_est_a: null, life_est_b: null };
     return EMMC_CACHE;
@@ -397,14 +394,13 @@ function wifi() {
 function ifaceRank(name) {
   var st = readTrimmed('/sys/class/net/' + name + '/operstate');
   if (st) {
-    st = st.trim();
     if (st === 'up') return 2;
     if (st === 'down') return 0;
     return 1;
   }
   var car = readTrimmed('/sys/class/net/' + name + '/carrier');
   if (!car) return 1;
-  return car.trim() === '1' ? 2 : 0;
+  return car === '1' ? 2 : 0;
 }
 
 function macAddress(iface) {
@@ -412,7 +408,7 @@ function macAddress(iface) {
   if (MAC_CACHE[iface]) return MAC_CACHE[iface];
   var raw = readTrimmed('/sys/class/net/' + iface + '/address');
   if (!raw) return null;
-  var mac = raw.trim().toLowerCase();
+  var mac = raw.toLowerCase();
   if (!/^([0-9a-f]{2}:){5}[0-9a-f]{2}$/.test(mac)) return null;
   if (mac === '00:00:00:00:00:00') return null;
   MAC_CACHE[iface] = mac;
@@ -996,12 +992,12 @@ function audioOutput(vs, sound) {
 }
 
 function formatPicMode(mode) {
-  return mode ? names.pictureMode(mode).display : 'Standard';
+  return names.pictureMode(mode || 'standard').display;
 }
 
 // The TV gives no dimension where the picture is SDR.
 function formatDynamicRange(dr) {
-  return dr ? names.dynamicRange(String(dr)).display : 'SDR';
+  return names.dynamicRange(dr ? String(dr) : 'sdr').display;
 }
 
 function pictureModes(cb) {
@@ -1225,7 +1221,7 @@ function sampleCpuTicks() {
   var out = { total: 0, procs: {} };
   try {
     var cpu = fs.readFileSync('/proc/stat', 'utf8').split('\n')[0].split(/\s+/);
-    for (var i = 1; i < cpu.length; i++) out.total += parseInt(cpu[i], 10) || 0;
+    for (var i = 1; i < cpu.length; i++) out.total += toInt(cpu[i], 0);
   } catch (e) {
     return null;
   }
@@ -1239,7 +1235,7 @@ function sampleCpuTicks() {
       if (close < 0) continue;
       var f = raw.slice(close + 2).split(' ');
       out.procs[entries[n]] = {
-        ticks: (parseInt(f[11], 10) || 0) + (parseInt(f[12], 10) || 0),
+        ticks: toInt(f[11], 0) + toInt(f[12], 0),
         comm: raw.slice(raw.indexOf('(') + 1, close)
       };
     } catch (e3) {}
@@ -1469,7 +1465,7 @@ function detectFrontLights(cb) {
 
 // LG stores the hour and minute as separate strings, "1" and "0" for 01:00.
 function clockTime(h, m) {
-  function pad2(v) { v = parseInt(v, 10) || 0; return (v < 10 ? '0' : '') + v; }
+  function pad2(v) { v = toInt(v, 0); return (v < 10 ? '0' : '') + v; }
   return pad2(h) + ':' + pad2(m);
 }
 
@@ -1672,13 +1668,13 @@ function collectStats(cb) {
      * off, which Home Assistant showed and which swapped the MQTT will; left
      * out, the live state keeps what it last knew.
      */
-    out.powerState = mapPowerStateFn && rawPower ? mapPowerStateFn(rawPower) : null;
+    out.powerState = rawPower ? power.mapState(rawPower) : null;
     if (out.powerState) {
       var on = powerModule ? powerModule.current() : { onReason: null, onTime: null };
       out.powerState.onReason = on.onReason;
       out.powerState.onTime = on.onTime;
     }
-    out.screenSaver = isScreenSaverFn ? isScreenSaverFn(out.powerState) : false;
+    out.screenSaver = power.isScreenSaver(out.powerState);
     out.screensaverMode = screensaversModule ? screensaversModule.screensaverMode() : 'stock';
     out.screensaverLevel = screensaversModule ? screensaversModule.screensaverLevel() : 'dim';
 
@@ -1847,8 +1843,7 @@ function collectStats(cb) {
             // their titles; the id only when neither is known.
             var isInput = inputNameMap[shortApp] && inputNameMap[shortApp] !== shortApp;
             out.app_name = inputNameMap[shortApp] || appTitles[app.appId] || shortApp;
-            out.display_title = isInput ?
-              (inputNameMap[shortApp] + ' (' + shortApp.toUpperCase() + ')') : out.app_name;
+            out.display_title = isInput ? names.inputTitle(shortApp, inputNameMap[shortApp]) : out.app_name;
 
             var hdmiMatch = String(app.appId).match(/^com\.webos\.app\.hdmi([1-4])$/i);
             var isScreenOff = out.screenSaver || (out.powerState && (out.powerState.screenOn === false || String(out.powerState.raw || out.powerState.state || '').toLowerCase() === 'off'));
